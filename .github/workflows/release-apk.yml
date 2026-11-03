@@ -1,0 +1,124 @@
+name: بناء APK للنشر (موقّع)
+
+# ضغطة واحدة: يبني ملف APK موقّعًا جاهزًا للنشر على APKPure.
+# أول مرة: يولّد مفتاح توقيع جديدًا ويضعه في ملف artifact مستقل لتحفظه.
+# لاحقًا (للتحديثات): ضع المفتاح في Secrets فيُستخدم نفسه كل مرة.
+on:
+  workflow_dispatch:
+    inputs:
+      version_name:
+        description: "رقم الإصدار الظاهر (مثال 1.0.0)"
+        required: false
+        default: "1.0.0"
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - name: تحديد رقم الإصدار
+        id: ver
+        env:
+          INPUT_VERSION: ${{ github.event.inputs.version_name }}
+        run: |
+          NAME="${INPUT_VERSION:-1.0.0}"
+          if ! [[ "$NAME" =~ ^[0-9]+(\.[0-9]+){0,2}$ ]]; then
+            echo "::error::رقم الإصدار غير صالح: $NAME (اكتب مثل 1.0.0)"; exit 1
+          fi
+          echo "name=$NAME" >> "$GITHUB_OUTPUT"
+
+      - name: تثبيت الحزم وبناء الخطوط
+        run: |
+          npm install --no-audit --no-fund
+          npm run fonts
+
+      - name: توليد مشروع الأندرويد
+        run: |
+          npx cap add android
+          VERSION_NAME="${{ steps.ver.outputs.name }}" VERSION_CODE="${GITHUB_RUN_NUMBER}" python3 scripts/patch-android.py
+          npx cap sync android
+
+      - name: مفتاح التوقيع
+        env:
+          KS: ${{ secrets.KEYSTORE_BASE64 }}
+          KP: ${{ secrets.KEYSTORE_PASSWORD }}
+          KA: ${{ secrets.KEY_ALIAS }}
+          KK: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          if [ -n "$KS" ] && [ -n "$KP" ] && [ -n "$KA" ] && [ -n "$KK" ]; then
+            echo "استخدام المفتاح المحفوظ في Secrets"
+            echo "$KS" | base64 -d > "$RUNNER_TEMP/release.jks"
+            {
+              echo "KEYSTORE_FILE=$RUNNER_TEMP/release.jks"
+              echo "KEYSTORE_PASSWORD=$KP"
+              echo "KEY_ALIAS=$KA"
+              echo "KEY_PASSWORD=$KK"
+              echo "NEW_KEY=false"
+            } >> "$GITHUB_ENV"
+          else
+            echo "لا يوجد مفتاح محفوظ: سيُولَّد مفتاح جديد"
+            PASS=$(openssl rand -hex 16)
+            echo "::add-mask::$PASS"
+            keytool -genkeypair -keystore "$RUNNER_TEMP/release.jks" -alias asma -keyalg RSA -keysize 4096 \
+              -validity 36500 -storepass "$PASS" -keypass "$PASS" \
+              -dname "CN=Asma Allah Al-Husna, O=Asma, C=EG"
+            mkdir -p newkey
+            cp "$RUNNER_TEMP/release.jks" newkey/asma-release.jks
+            base64 -w0 newkey/asma-release.jks > newkey/KEYSTORE_BASE64.txt
+            {
+              echo "KEYSTORE_PASSWORD = $PASS"
+              echo "KEY_ALIAS         = asma"
+              echo "KEY_PASSWORD      = $PASS"
+            } > newkey/passwords.txt
+            {
+              echo "KEYSTORE_FILE=$RUNNER_TEMP/release.jks"
+              echo "KEYSTORE_PASSWORD=$PASS"
+              echo "KEY_ALIAS=asma"
+              echo "KEY_PASSWORD=$PASS"
+              echo "NEW_KEY=true"
+            } >> "$GITHUB_ENV"
+          fi
+
+      - name: بناء الإصدار الموقّع
+        working-directory: android
+        run: ./gradlew assembleRelease --no-daemon
+
+      - name: تجهيز الملف والتحقق من التوقيع
+        id: out
+        run: |
+          OUT="Asma-Allah-Husna-${{ steps.ver.outputs.name }}.apk"
+          cp android/app/build/outputs/apk/release/app-release.apk "$OUT"
+          APKSIGNER=$(ls "$ANDROID_HOME"/build-tools/*/apksigner | sort -V | tail -n1)
+          "$APKSIGNER" verify --verbose --print-certs "$OUT"
+          sha256sum "$OUT" | tee "$OUT.sha256"
+          echo "file=$OUT" >> "$GITHUB_OUTPUT"
+
+      - name: ملف التطبيق (APK)
+        uses: actions/upload-artifact@v4
+        with:
+          name: APK-${{ steps.out.outputs.file }}
+          path: |
+            ${{ steps.out.outputs.file }}
+            ${{ steps.out.outputs.file }}.sha256
+
+      - name: مفتاح التوقيع الجديد (احفظه ثم احذفه فورًا)
+        if: env.NEW_KEY == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: SIGNING-KEY-download-then-delete
+          path: newkey
+          retention-days: 1
